@@ -30,7 +30,7 @@ def recognize_text(
         Dict matching Immich OCR response format:
         {
             "text": [str, ...],
-            "box": [x1, y1, x2, y2, ...],  # Flattened bbox coords
+            "box": [x1, y1, x2, y2, x3, y3, x4, y4, ...],  # 8 coords per text (quadrilateral)
             "boxScore": [float, ...],       # Detection confidence
             "textScore": [float, ...]       # Recognition confidence
         }
@@ -93,13 +93,21 @@ def recognize_text(
         bbox = observation.boundingBox()
         
         # Convert to pixel coordinates (flip Y axis)
-        x1 = bbox.origin.x * img_width
-        y1 = (1.0 - bbox.origin.y - bbox.size.height) * img_height
-        x2 = (bbox.origin.x + bbox.size.width) * img_width
-        y2 = (1.0 - bbox.origin.y) * img_height
+        # Vision uses bottom-left origin, Immich expects top-left
+        x = bbox.origin.x * img_width
+        y = (1.0 - bbox.origin.y - bbox.size.height) * img_height
+        w = bbox.size.width * img_width
+        h = bbox.size.height * img_height
         
-        # Add flattened box coordinates
-        boxes.extend([float(x1), float(y1), float(x2), float(y2)])
+        # Immich expects 8 coordinates per box (quadrilateral corners)
+        # Order: top-left, top-right, bottom-right, bottom-left (clockwise)
+        x1, y1 = int(x), int(y)              # top-left
+        x2, y2 = int(x + w), int(y)          # top-right
+        x3, y3 = int(x + w), int(y + h)      # bottom-right
+        x4, y4 = int(x), int(y + h)          # bottom-left
+        
+        # Add all 8 coordinates to the flat list
+        boxes.extend([x1, y1, x2, y2, x3, y3, x4, y4])
         
         # Box score (use observation confidence if available, otherwise same as text)
         box_scores.append(float(observation.confidence()) if hasattr(observation, 'confidence') else float(confidence))
@@ -149,10 +157,10 @@ if __name__ == "__main__":
     print(f"\nDetected {len(result['text'])} text region(s):")
     for i, text in enumerate(result['text']):
         score = result['textScore'][i]
-        # Get box coordinates (4 values per box)
-        box_start = i * 4
-        x1, y1, x2, y2 = result['box'][box_start:box_start + 4]
+        # Get box coordinates (8 values per box now)
+        box_start = i * 8
+        coords = result['box'][box_start:box_start + 8]
         print(f"  [{score:.2f}] \"{text}\"")
-        print(f"         Box: ({x1:.0f}, {y1:.0f}) - ({x2:.0f}, {y2:.0f})")
+        print(f"         Box (x1,y1,x2,y2,x3,y3,x4,y4): {coords}")
     
     print("\n✅ OCR test complete!")

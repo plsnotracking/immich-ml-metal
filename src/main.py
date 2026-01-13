@@ -24,16 +24,12 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# Lazy-load models to avoid startup delay
-_clip_model = None
-
-def get_clip():
-    """Get CLIP model, loading on first use."""
-    global _clip_model
-    if _clip_model is None and not STUB_MODE:
-        from .models.clip import get_clip_model
-        _clip_model = get_clip_model()
-    return _clip_model
+def get_clip(model_name: str = "ViT-B-32__openai"):
+    """Get CLIP model, loading on first use or switching if model changed."""
+    if STUB_MODE:
+        return None
+    from .models.clip import get_clip_model
+    return get_clip_model(model_name)
 
 
 def run_face_recognition(image_bytes: bytes, min_score: float, model_name: str) -> list[dict]:
@@ -65,9 +61,10 @@ def run_face_recognition(image_bytes: bytes, min_score: float, model_name: str) 
             )
         
         if embedding is not None:
+            # IMPORTANT: Immich expects embedding as a string, not an array
             results.append({
                 "boundingBox": face["boundingBox"],
-                "embedding": embedding.tolist(),
+                "embedding": str(embedding.tolist()),
                 "score": face["score"]
             })
     
@@ -137,11 +134,12 @@ async def predict(
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
-                    # Real inference
-                    clip = get_clip()
+                    # Real inference - pass model name for dynamic loading
+                    clip = get_clip(model_name)
                     embedding = clip.encode_image(image_bytes)
                 
-                response["clip"] = embedding.tolist()
+                # IMPORTANT: Immich expects CLIP embedding as a string
+                response["clip"] = str(embedding.tolist())
                 
             elif "textual" in task_config and text:
                 model_name = task_config["textual"].get("modelName", settings.clip_model)
@@ -150,10 +148,12 @@ async def predict(
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
-                    clip = get_clip()
+                    # Real inference - pass model name for dynamic loading
+                    clip = get_clip(model_name)
                     embedding = clip.encode_text(text)
                 
-                response["clip"] = embedding.tolist()
+                # IMPORTANT: Immich expects CLIP embedding as a string
+                response["clip"] = str(embedding.tolist())
         
         elif task_type == "facial-recognition":
             if image_bytes is None:
@@ -166,16 +166,17 @@ async def predict(
             model_name = recognition_config.get("modelName", settings.face_model)
             
             if STUB_MODE:
-                # Stub: return one fake face
+                # Stub: return one fake face (with string embedding)
+                fake_embedding = np.random.randn(512).astype(np.float32).tolist()
                 faces = [
                     {
                         "boundingBox": {
-                            "x1": float(img.width * 0.25),
-                            "y1": float(img.height * 0.15),
-                            "x2": float(img.width * 0.75),
-                            "y2": float(img.height * 0.85)
+                            "x1": int(img.width * 0.25),
+                            "y1": int(img.height * 0.15),
+                            "x2": int(img.width * 0.75),
+                            "y2": int(img.height * 0.85)
                         },
-                        "embedding": np.random.randn(512).astype(np.float32).tolist(),
+                        "embedding": str(fake_embedding),
                         "score": 0.99
                     }
                 ]

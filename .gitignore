@@ -1,0 +1,8 @@
+cache/
+immich-upstream/
+.venv/
+mlx-community/
+src/__pycache__/
+src/models/__pycache__/
+*.pyc
+*.pyo
