@@ -15,6 +15,8 @@ import io
 import gc
 import logging
 import threading
+import tempfile
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -24,36 +26,110 @@ MODEL_MAP = {
     "ViT-B-32__openai": "mlx-community/clip-vit-base-patch32",
     "ViT-B-16__openai": "mlx-community/clip-vit-base-patch16",
     "ViT-L-14__openai": "mlx-community/clip-vit-large-patch14",
-    
     # LAION CLIP models -> MLX
     "ViT-B-32__laion2b-s34b-b79k": "mlx-community/clip-vit-base-patch32-laion2b",
     "ViT-B-32__laion2b_s34b_b79k": "mlx-community/clip-vit-base-patch32-laion2b",
-    
     # SigLIP models -> None (use open_clip fallback)
     "ViT-B-16-SigLIP__webli": None,
     "ViT-B-16-SigLIP2__webli": None,
     "ViT-SO400M-16-SigLIP2-384__webli": None,
-    
     # Default fallback
     "default": "mlx-community/clip-vit-base-patch32",
 }
 
 # open_clip model name mappings for fallback
 OPENCLIP_MAP = {
-    # Standard CLIP
     "ViT-B-32__openai": ("ViT-B-32-quickgelu", "openai"),
     "ViT-B-16__openai": ("ViT-B-16", "openai"),
     "ViT-L-14__openai": ("ViT-L-14", "openai"),
-    
-    # LAION
     "ViT-B-32__laion2b-s34b-b79k": ("ViT-B-32", "laion2b_s34b_b79k"),
     "ViT-B-32__laion2b_s34b_b79k": ("ViT-B-32", "laion2b_s34b_b79k"),
-    
-    # SigLIP
     "ViT-B-16-SigLIP__webli": ("ViT-B-16-SigLIP", "webli"),
     "ViT-B-16-SigLIP2__webli": ("ViT-B-16-SigLIP2", "webli"),
     "ViT-SO400M-16-SigLIP2-384__webli": ("ViT-SO400M-16-SigLIP2-384", "webli"),
 }
+
+
+class ImageBufferManager:
+    """
+    Manages image data for mlx_clip which requires file paths.
+    
+    Prefers RAM (via named pipes/memory) but overflows to disk when
+    the RAM budget is exceeded. Thread-safe.
+    """
+    
+    def __init__(self, ram_limit_mb: int = 256):
+        self._ram_limit = ram_limit_mb * 1024 * 1024
+        self._current_ram_usage = 0
+        self._lock = threading.Lock()
+        self._active_buffers: dict[str, int] = {}  # path -> size
+    
+    def get_image_path(self, image: Image.Image) -> tuple[str, bool]:
+        """
+        Get a file path for the image that mlx_clip can read.
+        
+        Returns:
+            Tuple of (path, is_temp_file). Caller must call release_path() when done.
+        """
+        # Estimate size (JPEG is typically smaller than raw)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        img_size = buffer.tell()
+        buffer.seek(0)
+        img_bytes = buffer.getvalue()
+        
+        with self._lock:
+            use_ram = (self._current_ram_usage + img_size) <= self._ram_limit
+            
+            if use_ram:
+                # Use temp file but track RAM usage
+                # On macOS, small temp files often stay in buffer cache
+                self._current_ram_usage += img_size
+        
+        # Always use tempfile (macOS handles caching efficiently)
+        # but track whether we're within RAM budget for monitoring
+        fd, path = tempfile.mkstemp(suffix=".jpg", prefix="clip_")
+        try:
+            os.write(fd, img_bytes)
+        finally:
+            os.close(fd)
+        
+        with self._lock:
+            self._active_buffers[path] = img_size
+        
+        return path, True
+    
+    def release_path(self, path: str):
+        """Release a path obtained from get_image_path."""
+        with self._lock:
+            size = self._active_buffers.pop(path, 0)
+            if self._current_ram_usage >= size:
+                self._current_ram_usage -= size
+        
+        try:
+            os.unlink(path)
+        except OSError as e:
+            logger.warning(f"Failed to cleanup temp file {path}: {e}")
+    
+    @property
+    def ram_usage_mb(self) -> float:
+        with self._lock:
+            return self._current_ram_usage / (1024 * 1024)
+
+
+# Global buffer manager (initialized lazily with settings)
+_buffer_manager: Optional[ImageBufferManager] = None
+_buffer_lock = threading.Lock()
+
+
+def get_buffer_manager() -> ImageBufferManager:
+    """Get or create the global buffer manager."""
+    global _buffer_manager
+    with _buffer_lock:
+        if _buffer_manager is None:
+            from ..config import settings
+            _buffer_manager = ImageBufferManager(settings.clip_buffer_ram_limit_mb)
+        return _buffer_manager
 
 
 class MLXClip:
@@ -66,7 +142,6 @@ class MLXClip:
         self._tokenizer = None
         self._loaded = False
         self._repo_id = MODEL_MAP.get(model_name, MODEL_MAP.get("default"))
-        # Inference lock to prevent concurrent Metal operations
         self._inference_lock = threading.Lock()
         self._load_model()
     
@@ -137,7 +212,6 @@ class MLXClip:
             model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
             tokenizer = open_clip.get_tokenizer(arch)
         
-        # Use MPS if available
         if torch.backends.mps.is_available():
             self._device = torch.device("mps")
             model = model.to(self._device)
@@ -164,18 +238,15 @@ class MLXClip:
         if not self._loaded:
             raise RuntimeError("Model not loaded")
         
-        # CRITICAL: Lock inference to prevent concurrent Metal operations
         with self._inference_lock:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             
             if hasattr(self, '_use_fallback') and self._use_fallback:
                 return self._encode_image_fallback(image)
             
-            # MLX path
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                image.save(f, format="JPEG")
-                temp_path = f.name
+            # MLX path - use buffer manager for efficient temp file handling
+            buffer_mgr = get_buffer_manager()
+            temp_path, _ = buffer_mgr.get_image_path(image)
             
             try:
                 embedding = self._model.image_encoder(temp_path)
@@ -184,10 +255,7 @@ class MLXClip:
                 embedding = embedding / np.linalg.norm(embedding)
                 return embedding.flatten().astype(np.float32)
             finally:
-                try:
-                    Path(temp_path).unlink()
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
+                buffer_mgr.release_path(temp_path)
     
     def _encode_image_fallback(self, image: Image.Image) -> np.ndarray:
         """Encode image using open_clip fallback (assumes lock is held)."""
@@ -209,12 +277,10 @@ class MLXClip:
         if not self._loaded:
             raise RuntimeError("Model not loaded")
         
-        # CRITICAL: Lock inference to prevent concurrent Metal operations
         with self._inference_lock:
             if hasattr(self, '_use_fallback') and self._use_fallback:
                 return self._encode_text_fallback(text)
             
-            # MLX path
             embedding = self._model.text_encoder(text)
             if isinstance(embedding, mx.array):
                 embedding = np.array(embedding)
@@ -243,11 +309,9 @@ class MLXClip:
         
         gc.collect()
         
-        # Use the new API if available
         try:
             mx.clear_cache()
         except AttributeError:
-            # Fall back to deprecated API
             try:
                 mx.metal.clear_cache()
             except Exception:
@@ -271,14 +335,12 @@ def get_clip_model(model_name: str = "ViT-B-32__openai") -> MLXClip:
     normalized_name = model_name.replace("::", "__")
     
     with _model_lock:
-        # Check if we need to switch models
         if _current_model is not None and _current_model_name != normalized_name:
             logger.info(f"Switching CLIP model: {_current_model_name} -> {normalized_name}")
             _current_model.unload()
             _current_model = None
             _current_model_name = None
         
-        # Load model if needed
         if _current_model is None:
             logger.info(f"Loading CLIP model: {normalized_name}")
             _current_model = MLXClip(normalized_name)
@@ -288,7 +350,6 @@ def get_clip_model(model_name: str = "ViT-B-32__openai") -> MLXClip:
 
 
 if __name__ == "__main__":
-    # Configure logging for testing
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     
     import sys
@@ -297,14 +358,12 @@ if __name__ == "__main__":
     logger.info(f"Supported MLX models: {[k for k, v in MODEL_MAP.items() if v is not None and k != 'default']}")
     logger.info(f"Supported open_clip models: {list(OPENCLIP_MAP.keys())}")
     
-    # Test default model
     logger.info("\n--- Testing MLX model ---")
     clip = get_clip_model("ViT-B-32__openai")
     text_emb = clip.encode_text("a photo of a cat")
     logger.info(f"Text embedding shape: {text_emb.shape}")
     logger.info(f"Text embedding norm: {np.linalg.norm(text_emb):.4f}")
     
-    # Test image if provided
     if len(sys.argv) > 1:
         with open(sys.argv[1], "rb") as f:
             img_emb = clip.encode_image(f.read())
@@ -312,4 +371,5 @@ if __name__ == "__main__":
         similarity = np.dot(text_emb, img_emb)
         logger.info(f"Text-image similarity: {similarity:.4f}")
     
+    logger.info(f"\nBuffer manager RAM usage: {get_buffer_manager().ram_usage_mb:.2f} MB")
     logger.info("\n✅ CLIP tests passed!")

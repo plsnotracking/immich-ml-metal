@@ -19,11 +19,8 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Configure logging based on settings
+settings.configure_logging()
 logger = logging.getLogger(__name__)
 
 # Use real models unless STUB_MODE is set
@@ -31,6 +28,17 @@ STUB_MODE = os.getenv("STUB_MODE", "false").lower() == "true"
 
 if STUB_MODE:
     logger.warning("Running in STUB_MODE - returning fake data")
+
+# Semaphore for backpressure - limits queued requests
+_request_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def get_request_semaphore() -> asyncio.Semaphore:
+    """Get or create the request semaphore (lazy init for async context)."""
+    global _request_semaphore
+    if _request_semaphore is None:
+        _request_semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+    return _request_semaphore
 
 
 # Pydantic models for response validation
@@ -72,22 +80,28 @@ async def lifespan(app: FastAPI):
     logger.info(f"CLIP model: {settings.clip_model}")
     logger.info(f"Face model: {settings.face_model}")
     logger.info(f"Face min score: {settings.face_min_score}")
-    logger.info(f"Max image size: {settings.max_image_size / 1024 / 1024:.1f}MB")
+    logger.info(f"Max concurrent requests: {settings.max_concurrent_requests}")
+    logger.info(f"Log level: {settings.log_level}")
     
     yield
     
-    # Cleanup on shutdown
+    # Cleanup on shutdown - import modules to access current state
     logger.info("Shutting down immich-ml-metal service")
     if not STUB_MODE:
         try:
-            from .models.clip import _current_model, _model_lock
-            from .models.face_embed import unload_recognition_model
+            from .models import clip as clip_module
+            from .models import face_embed as face_module
             
-            with _model_lock:
-                if _current_model:
-                    _current_model.unload()
+            # Cleanup CLIP model
+            with clip_module._model_lock:
+                if clip_module._current_model is not None:
+                    clip_module._current_model.unload()
+                    clip_module._current_model = None
+                    clip_module._current_model_name = None
             
-            unload_recognition_model()
+            # Cleanup face recognition model
+            face_module.unload_recognition_model()
+            
             logger.info("Models unloaded successfully")
         except Exception as e:
             logger.error(f"Error during model cleanup: {e}")
@@ -101,12 +115,14 @@ app = FastAPI(
 )
 
 
-# Middleware for request logging
+# Middleware for request logging (conditional based on settings)
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"{request.method} {request.url.path}")
+    if settings.log_requests:
+        logger.info(f"{request.method} {request.url.path}")
     response = await call_next(request)
-    logger.debug(f"Response status: {response.status_code}")
+    if settings.log_requests:
+        logger.debug(f"Response status: {response.status_code}")
     return response
 
 
@@ -124,7 +140,6 @@ async def run_face_recognition_async(
     model_name: str
 ) -> list[dict]:
     """Run face detection and embedding generation (async wrapper)."""
-    # Run blocking operations in thread pool
     return await asyncio.to_thread(
         _run_face_recognition_sync,
         image_bytes,
@@ -142,16 +157,13 @@ def _run_face_recognition_sync(
     from .models.face_detect import detect_faces
     from .models.face_embed import get_face_embedding, get_face_embedding_from_bbox
     
-    # Detect faces using Vision framework
     faces, _, _ = detect_faces(image_bytes)
     
-    # Filter by score and generate embeddings
     results = []
     for face in faces:
         if face["score"] < min_score:
             continue
         
-        # Generate embedding
         if "landmarks" in face:
             embedding = get_face_embedding(image_bytes, face["landmarks"], model_name)
         else:
@@ -203,7 +215,7 @@ async def health():
                 health_status["checks"]["clip"] = f"error: {str(e)}"
                 health_status["status"] = "degraded"
             
-            # Check face model
+            # Check face recognition model
             try:
                 from .models.face_embed import get_recognition_model
                 get_recognition_model(settings.face_model)
@@ -213,8 +225,19 @@ async def health():
                 health_status["checks"]["face_recognition"] = f"error: {str(e)}"
                 health_status["status"] = "degraded"
             
-            # Vision framework checks (face detection and OCR) are lightweight
-            health_status["checks"]["vision_framework"] = "ok"
+            # Actually test Vision framework with a minimal image
+            try:
+                from .models.face_detect import detect_faces
+                # Create 1x1 test image
+                test_img = Image.new("RGB", (1, 1), color=(128, 128, 128))
+                buffer = io.BytesIO()
+                test_img.save(buffer, format="JPEG")
+                detect_faces(buffer.getvalue())
+                health_status["checks"]["vision_framework"] = "ok"
+            except Exception as e:
+                logger.error(f"Vision framework health check failed: {e}")
+                health_status["checks"]["vision_framework"] = f"error: {str(e)}"
+                health_status["status"] = "degraded"
         else:
             health_status["checks"]["stub_mode"] = "active"
         
@@ -223,10 +246,7 @@ async def health():
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
         return JSONResponse(
-            content={
-                "status": "unhealthy",
-                "error": str(e)
-            },
+            content={"status": "unhealthy", "error": str(e)},
             status_code=503
         )
 
@@ -248,6 +268,26 @@ async def predict(
     Returns:
         ORJSONResponse with inference results
     """
+    # Apply backpressure via semaphore
+    semaphore = get_request_semaphore()
+    try:
+        # Use timeout to avoid indefinite queuing
+        async with asyncio.timeout(settings.request_timeout):
+            async with semaphore:
+                return await _process_predict(entries, image, text)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Service overloaded, request timed out waiting in queue"
+        )
+
+
+async def _process_predict(
+    entries: str,
+    image: Optional[UploadFile],
+    text: Optional[str],
+) -> ORJSONResponse:
+    """Internal predict processing (assumes semaphore is held)."""
     # Parse the entries JSON
     try:
         tasks = json.loads(entries)
@@ -255,7 +295,6 @@ async def predict(
         logger.error(f"Invalid entries JSON: {e}")
         raise HTTPException(status_code=422, detail=f"Invalid entries JSON: {e}")
     
-    # Validate input
     if image is None and text is None:
         raise HTTPException(
             status_code=400, 
@@ -268,7 +307,6 @@ async def predict(
     image_bytes = None
     img = None
     if image:
-        # Check file size
         if image.size and image.size > settings.max_image_size:
             raise HTTPException(
                 status_code=413,
@@ -281,7 +319,6 @@ async def predict(
             response["imageHeight"] = img.height
             response["imageWidth"] = img.width
             
-            # Validate image isn't ridiculously large
             if img.width * img.height > 100_000_000:  # 100 megapixels
                 raise HTTPException(
                     status_code=413,
@@ -298,16 +335,13 @@ async def predict(
     for task_type, task_config in tasks.items():
         
         if task_type == "clip":
-            # CLIP embedding task
             if "visual" in task_config and image_bytes:
                 model_name = task_config["visual"].get("modelName", settings.clip_model)
                 
                 if STUB_MODE:
-                    # Stub: return random normalized embedding
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
-                    # Real inference - run in thread pool to avoid blocking
                     clip = get_clip(model_name)
                     embedding = await asyncio.to_thread(
                         clip.encode_image,
@@ -323,7 +357,6 @@ async def predict(
                     embedding = np.random.randn(512).astype(np.float32)
                     embedding = embedding / np.linalg.norm(embedding)
                 else:
-                    # Real inference
                     clip = get_clip(model_name)
                     embedding = await asyncio.to_thread(
                         clip.encode_text,
@@ -339,7 +372,6 @@ async def predict(
             detection_config = task_config.get("detection", {})
             recognition_config = task_config.get("recognition", {})
             
-            # Use Immich's min_score if provided, otherwise use our default
             min_score = detection_config.get("options", {}).get(
                 "minScore", 
                 settings.face_min_score
@@ -347,7 +379,6 @@ async def predict(
             model_name = recognition_config.get("modelName", settings.face_model)
             
             if STUB_MODE:
-                # Stub: return one fake face
                 fake_embedding = np.random.randn(512).astype(np.float32).tolist()
                 faces = [
                     {
@@ -362,7 +393,6 @@ async def predict(
                     }
                 ]
             else:
-                # Real inference
                 faces = await run_face_recognition_async(
                     image_bytes,
                     min_score,
@@ -383,7 +413,6 @@ async def predict(
             min_score = max(min_detection_score, min_recognition_score)
             
             if STUB_MODE:
-                # Stub: return fake OCR result
                 response["ocr"] = {
                     "text": ["placeholder", "text"],
                     "box": [0, 0, 100, 0, 100, 50, 0, 50, 0, 50, 100, 50, 100, 100, 0, 100],
@@ -391,35 +420,38 @@ async def predict(
                     "textScore": [0.98, 0.96]
                 }
             else:
-                # Real inference - run in thread pool
                 from .models.ocr import recognize_text
                 ocr_result = await asyncio.to_thread(
                     recognize_text,
                     image_bytes,
-                    min_confidence=min_score
+                    min_confidence=min_score,
+                    use_language_correction=settings.ocr_use_language_correction
                 )
                 response["ocr"] = ocr_result
     
-    # Validate response against schema
+    # Validate response against schema - fail loudly if validation fails
     try:
         validated_response = PredictResponse(**response)
         return ORJSONResponse(validated_response.model_dump(by_alias=True, exclude_none=True))
     except Exception as e:
         logger.error(f"Response validation failed: {e}", exc_info=True)
-        # Return anyway but log the issue
-        return ORJSONResponse(response)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error: response validation failed"
+        )
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Global exception handler for unexpected errors."""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    
+    # Only expose error details in debug mode (should be off for network-exposed service)
+    error_detail = str(exc) if settings.debug_mode else "Internal server error"
+    
     return JSONResponse(
         status_code=500,
-        content={
-            "detail": "Internal server error",
-            "error": str(exc) if settings.host == "0.0.0.0" else "Internal server error"
-        }
+        content={"detail": "Internal server error", "error": error_detail}
     )
 
 
@@ -433,8 +465,8 @@ def main():
         "src.main:app",
         host=settings.host,
         port=settings.port,
-        reload=False,  # Don't enable reload in production
-        log_level="info",
+        reload=False,
+        log_level=settings.log_level.lower(),
         timeout_keep_alive=settings.request_timeout,
     )
 

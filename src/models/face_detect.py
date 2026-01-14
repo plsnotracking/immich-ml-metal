@@ -10,7 +10,7 @@ import io
 from typing import Optional
 import logging
 import objc
-from Foundation import NSData
+from Foundation import NSData, NSAutoreleasePool
 import Vision
 import Quartz
 
@@ -32,24 +32,31 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
           - landmarks: 5-point landmarks for alignment (if available)
     """
     try:
-        # Load image to get dimensions
         pil_image = Image.open(io.BytesIO(image_bytes))
         img_width, img_height = pil_image.size
     except Exception as e:
         logger.error(f"Failed to load image: {e}")
         raise ValueError(f"Invalid image data: {e}") from e
     
+    # Use autorelease pool to prevent memory accumulation in long-running service
+    pool = NSAutoreleasePool.alloc().init()
     try:
-        # Create NSData from image bytes
+        return _detect_faces_impl(image_bytes, img_width, img_height)
+    finally:
+        del pool
+
+
+def _detect_faces_impl(
+    image_bytes: bytes, 
+    img_width: int, 
+    img_height: int
+) -> tuple[list[dict], int, int]:
+    """Internal face detection implementation (assumes autorelease pool is active)."""
+    try:
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
-        
-        # Create Vision image request handler
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
-        
-        # Create face detection request with landmarks
         request = Vision.VNDetectFaceLandmarksRequest.alloc().init()
         
-        # Perform the request
         success, error = handler.performRequests_error_([request], None)
         
         if not success or error:
@@ -60,7 +67,6 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
         results = request.results() or []
         
         for observation in results:
-            # Get bounding box (normalized coordinates, origin at bottom-left)
             bbox = observation.boundingBox()
             
             # Convert to pixel coordinates (flip Y axis - Vision uses bottom-left origin)
@@ -79,7 +85,6 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
                 "score": float(observation.confidence()),
             }
             
-            # Extract 5-point landmarks for face alignment
             landmarks = observation.landmarks()
             if landmarks:
                 five_points = extract_five_point_landmarks(landmarks, img_width, img_height)
@@ -150,14 +155,20 @@ def extract_five_point_landmarks(
             p = nose_points[-1]
             nose = [p.x * img_width, (1.0 - p.y) * img_height]
         
-        # Mouth corners - from outer lips region
+        # Mouth corners - find leftmost and rightmost points by x-coordinate
+        # (Vision framework doesn't guarantee point ordering in contours)
         left_mouth = None
         right_mouth = None
         outer_lips_points = get_region_points(landmarks.outerLips())
-        if len(outer_lips_points) >= 12:
-            # Point 0 is typically left corner, point 6 is right corner
-            left_mouth = [outer_lips_points[0].x * img_width, (1.0 - outer_lips_points[0].y) * img_height]
-            right_mouth = [outer_lips_points[6].x * img_width, (1.0 - outer_lips_points[6].y) * img_height]
+        if outer_lips_points:
+            # Convert all points to pixel coordinates
+            lips_px = [
+                (p.x * img_width, (1.0 - p.y) * img_height) 
+                for p in outer_lips_points
+            ]
+            # Find extremes by x-coordinate
+            left_mouth = list(min(lips_px, key=lambda p: p[0]))
+            right_mouth = list(max(lips_px, key=lambda p: p[0]))
         
         # All 5 points must be present
         if all([left_eye, right_eye, nose, left_mouth, right_mouth]):
@@ -174,14 +185,12 @@ def extract_five_point_landmarks(
 if __name__ == "__main__":
     import sys
     
-    # Configure logging for testing
     logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
     
     if len(sys.argv) < 2:
         logger.info("Usage: python -m src.models.face_detect <image_path>")
         logger.info("Creating test with a blank image...")
         
-        # Create a simple test image
         test_img = Image.new("RGB", (640, 480), color=(200, 180, 170))
         buffer = io.BytesIO()
         test_img.save(buffer, format="JPEG")

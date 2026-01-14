@@ -6,7 +6,7 @@ python-multipart>=0.0.6
 
 # Image processing
 pillow>=10.0.0
-numpy>=1.26.0,<2.0
+numpy>=1.26.0
 opencv-python>=4.9.0
 
 # Apple frameworks via PyObjC
@@ -15,7 +15,9 @@ pyobjc-framework-Quartz>=10.0
 pyobjc-framework-CoreML>=10.0
 
 # MLX for CLIP (Apple Silicon optimized)
-mlx>=0.4.0
+# Requires macOS >= 14.0, Python >= 3.10
+# Current stable: 0.30.x (Dec 2025)
+mlx>=0.22.0
 huggingface-hub>=0.20.0
 
 # Pin mlx-clip to specific commit for stability
@@ -26,9 +28,9 @@ mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50e
 # Fallback if you want to use open_clip instead of mlx-clip:
 # open-clip-torch>=2.24.0
 
-# Face recognition - official onnxruntime now supports Apple Silicon via CoreML
-# No need for onnxruntime-silicon anymore as of v1.17+
-onnxruntime>=1.17.0
+# Face recognition - official onnxruntime supports Apple Silicon via CoreML
+# onnxruntime 1.18+ supports numpy 2.x
+onnxruntime>=1.18.0
 insightface>=0.7.3
 
 # Development/testing

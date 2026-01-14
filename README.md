@@ -21,15 +21,12 @@ This service uses Apple's MLX framework for CLIP. In my testing, this is signifi
 
 ** A(I)lpha Quality - Use at Your Own Risk**
 
-- [x] Phase 0: API contract documentation
-- [x] Phase 1: Project setup  
-- [x] Phase 2: Stub service (placeholder responses)
-- [x] Phase 3: CLIP implementation (MLX + open_clip fallback)
-- [x] Phase 4: Face detection (Vision framework)
-- [x] Phase 5: Face embeddings (InsightFace + CoreML)
-- [x] Phase 6: OCR (Vision framework)
-- [x] Phase 7: Basic integration testing with real Immich instance
-- [ ] Phase 8: Community testing and validation
+- [x] CLIP implementation (MLX + open_clip fallback)
+- [x] Face detection (Vision framework)
+- [x] Face embeddings (InsightFace + CoreML)
+- [x] OCR (Vision framework)
+- [x] Basic integration testing with real Immich instance
+- [ ] Community testing and validation
 
 **Known Limitations:**
 - Only tested in my specific home setup (MacBook Pro M1, macOS 26.1, Immich v2.4.1)
@@ -79,10 +76,16 @@ Configure via environment variables or edit `src/config.py`:
 | `ML_PORT` | `3003` | Port number (must match Immich config) |
 | `ML_MODELS_DIR` | `./models` | Model storage directory |
 | `ML_CLIP_MODEL` | `ViT-B-32__openai` | CLIP model name |
+| `ML_CLIP_BUFFER_RAM_MB` | `256` | Max RAM for image encode queue (MB) |
 | `ML_FACE_MODEL` | `buffalo_l` | Face recognition model (buffalo_s/m/l) |
 | `ML_FACE_MIN_SCORE` | `0.7` | Face detection confidence threshold |
+| `ML_OCR_LANGUAGE_CORRECTION` | `true` | Language correction for OCR (disable for codes/serials) |
 | `ML_USE_COREML` | `true` | Enable CoreML acceleration |
 | `ML_USE_ANE` | `true` | Enable Apple Neural Engine |
+| `ML_MAX_CONCURRENT_REQUESTS` | `4` | Max queued requests before backpressure |
+| `ML_LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG/INFO/WARNING/ERROR) |
+| `ML_LOG_REQUESTS` | `true` | Log individual requests (disable for high volume) |
+| `ML_DEBUG_MODE` | `false` | Expose error details (keep false when network-exposed) |
 
 ### Model Choices
 
@@ -173,6 +176,10 @@ curl http://localhost:3003/ping
 # Service info
 curl http://localhost:3003/
 # Should return: {"message":"Immich ML"}
+
+# Detailed health (checks all components)
+curl http://localhost:3003/health
+# Should return: {"status":"healthy","checks":{...}}
 
 # Test CLIP text encoding
 curl -X POST http://localhost:3003/predict \

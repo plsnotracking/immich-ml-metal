@@ -17,11 +17,15 @@ import gc
 
 logger = logging.getLogger(__name__)
 
+# Expected model characteristics for ArcFace recognition models
+ARCFACE_INPUT_SIZE = 112
+ARCFACE_EMBEDDING_DIM = 512
+
 # Global model cache with thread safety
 _recognition_model = None
 _current_model_name: Optional[str] = None
 _model_lock = threading.Lock()
-_inference_lock = threading.Lock()  # Separate lock for inference
+_inference_lock = threading.Lock()
 
 
 def get_recognition_model(model_name: str = "buffalo_l"):
@@ -37,18 +41,96 @@ def get_recognition_model(model_name: str = "buffalo_l"):
     global _recognition_model, _current_model_name
     
     with _model_lock:
-        # Check if we need to switch models
         if _recognition_model is not None and _current_model_name != model_name:
             logger.info(f"Switching face model: {_current_model_name} -> {model_name}")
             unload_recognition_model()
         
-        # Load model if needed
         if _recognition_model is None:
             logger.info(f"Loading face recognition model: {model_name}")
             _load_model(model_name)
             _current_model_name = model_name
         
         return _recognition_model
+
+
+def _find_recognition_model(model_dir: Path) -> Optional[Path]:
+    """
+    Find the recognition model in a model pack directory.
+    
+    Uses shape validation to identify ArcFace models rather than
+    relying on filename patterns which may change between versions.
+    
+    Returns:
+        Path to the recognition model, or None if not found.
+    """
+    import onnxruntime as ort
+    
+    onnx_files = list(model_dir.glob("*.onnx"))
+    if not onnx_files:
+        return None
+    
+    # Known filename patterns (checked first for speed)
+    known_patterns = ["w600k", "w300k", "glintr", "arcface"]
+    
+    for f in onnx_files:
+        if any(pattern in f.name.lower() for pattern in known_patterns):
+            # Verify it's actually a recognition model by checking shapes
+            if _validate_recognition_model(f):
+                return f
+    
+    # Fallback: check all ONNX files for correct input/output shapes
+    for f in onnx_files:
+        if _validate_recognition_model(f):
+            logger.info(f"Found recognition model by shape validation: {f.name}")
+            return f
+    
+    return None
+
+
+def _validate_recognition_model(model_path: Path) -> bool:
+    """
+    Validate that an ONNX model is an ArcFace recognition model.
+    
+    Checks:
+    - Input shape compatible with (batch, 3, 112, 112)
+    - Output shape compatible with (batch, 512)
+    """
+    try:
+        import onnxruntime as ort
+        
+        # Quick session just to check metadata
+        sess = ort.InferenceSession(
+            str(model_path), 
+            providers=["CPUExecutionProvider"]
+        )
+        
+        # Check input shape
+        input_info = sess.get_inputs()[0]
+        input_shape = input_info.shape
+        # Shape could be [batch, 3, 112, 112] or with dynamic batch
+        if len(input_shape) != 4:
+            return False
+        # Check spatial dimensions (indices 2 and 3)
+        if input_shape[2] != ARCFACE_INPUT_SIZE or input_shape[3] != ARCFACE_INPUT_SIZE:
+            return False
+        # Check channels (index 1)
+        if input_shape[1] != 3:
+            return False
+        
+        # Check output shape
+        output_info = sess.get_outputs()[0]
+        output_shape = output_info.shape
+        if len(output_shape) != 2:
+            return False
+        # Check embedding dimension (index 1)
+        if output_shape[1] != ARCFACE_EMBEDDING_DIM:
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.debug(f"Model validation failed for {model_path}: {e}")
+        return False
 
 
 def _load_model(model_name: str):
@@ -66,11 +148,9 @@ def _load_model(model_name: str):
             "Install with: pip install insightface onnxruntime"
         ) from e
     
-    # Check available providers
     available = ort.get_available_providers()
     logger.info(f"ONNX Runtime providers available: {available}")
     
-    # Prefer CoreML for Apple Silicon
     if "CoreMLExecutionProvider" in available:
         providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
         logger.info("Using CoreML for face recognition")
@@ -81,25 +161,24 @@ def _load_model(model_name: str):
     # Download model pack if needed
     model_dir = Path.home() / ".insightface" / "models" / model_name
     if not model_dir.exists():
-        logger.info(f"Downloading {model_name} model pack (first run, ~60-350MB)")
+        logger.info(f"Downloading {model_name} model pack (first run)")
         try:
             ensure_available("models", model_name, root=str(Path.home() / ".insightface"))
         except Exception as e:
             logger.error(f"Failed to download model pack: {e}", exc_info=True)
             raise RuntimeError(f"Could not download {model_name} model pack") from e
     
-    # Find the recognition model file
-    rec_model_path = None
-    for f in model_dir.glob("*.onnx"):
-        # Recognition models have w600k, w300k, or glintr in name
-        if any(pattern in f.name.lower() for pattern in ["w600k", "w300k", "glintr"]):
-            rec_model_path = f
-            break
+    # Find the recognition model using robust detection
+    rec_model_path = _find_recognition_model(model_dir)
     
     if rec_model_path is None:
-        logger.error(f"No recognition model found in {model_dir}")
-        logger.info(f"Available files: {list(model_dir.glob('*.onnx'))}")
-        raise FileNotFoundError(f"No recognition model found in {model_dir}")
+        available_files = [f.name for f in model_dir.glob("*.onnx")]
+        logger.error(f"No valid recognition model found in {model_dir}")
+        logger.error(f"Available ONNX files: {available_files}")
+        raise FileNotFoundError(
+            f"No ArcFace recognition model (input: 3x112x112, output: 512-dim) "
+            f"found in {model_dir}"
+        )
     
     logger.info(f"Loading recognition model: {rec_model_path.name}")
     
@@ -145,7 +224,6 @@ def get_face_embedding(
         logger.error("insightface not available")
         raise RuntimeError("Install insightface: pip install insightface") from e
     
-    # Decode image to BGR (OpenCV format)
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -155,22 +233,16 @@ def get_face_embedding(
         logger.error(f"Image decoding failed: {e}")
         raise
     
-    # Convert landmarks to numpy array
     kps = np.array(landmarks, dtype=np.float32)
     
-    # Align face using landmarks (ArcFace expects 112x112 aligned face)
     try:
-        aligned_face = face_align.norm_crop(img_bgr, kps, image_size=112)
+        aligned_face = face_align.norm_crop(img_bgr, kps, image_size=ARCFACE_INPUT_SIZE)
     except Exception as e:
         logger.error(f"Face alignment failed: {e}")
         raise
     
-    # Get recognition model
     model = get_recognition_model(model_name)
     
-    # CRITICAL: Lock inference to prevent concurrent operations
-    # While ONNX Runtime with CoreML is more robust than MLX,
-    # we still serialize to be safe and avoid resource contention
     with _inference_lock:
         try:
             embedding = model.get_feat(aligned_face)
@@ -178,7 +250,6 @@ def get_face_embedding(
             logger.error(f"Embedding generation failed: {e}")
             raise
     
-    # Normalize
     embedding = embedding.flatten()
     embedding = embedding / np.linalg.norm(embedding)
     
@@ -204,14 +275,12 @@ def get_face_embedding_from_bbox(
         512-dimensional normalized embedding, or None if failed
     """
     try:
-        # Decode image
         nparr = np.frombuffer(image_bytes, np.uint8)
         img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img_bgr is None:
             logger.error("Failed to decode image")
             return None
         
-        # Crop face region with padding
         x1, y1 = int(bbox["x1"]), int(bbox["y1"])
         x2, y2 = int(bbox["x2"]), int(bbox["y2"])
         
@@ -230,17 +299,13 @@ def get_face_embedding_from_bbox(
             logger.error("Empty face crop")
             return None
         
-        # Resize to 112x112 (ArcFace input size)
-        face_resized = cv2.resize(face_crop, (112, 112))
+        face_resized = cv2.resize(face_crop, (ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE))
         
-        # Get embedding
         model = get_recognition_model(model_name)
         
-        # CRITICAL: Lock inference
         with _inference_lock:
             embedding = model.get_feat(face_resized)
         
-        # Normalize
         embedding = embedding.flatten()
         embedding = embedding / np.linalg.norm(embedding)
         
@@ -260,17 +325,14 @@ def get_face_recognizer(model_name: str = "buffalo_l"):
 if __name__ == "__main__":
     import sys
     
-    # Configure logging for testing
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     
     logger.info("Testing face embedding generation...")
-    logger.info("(This will download the model on first run, ~60-350MB depending on model)")
+    logger.info("(This will download the model on first run)")
     
-    # Test model loading
     model = get_recognition_model("buffalo_l")
     logger.info(f"Model loaded successfully: {type(model).__name__}")
     
-    # If image provided, test full pipeline
     if len(sys.argv) > 1:
         from .face_detect import detect_faces
         
