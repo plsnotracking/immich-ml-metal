@@ -31,14 +31,14 @@ dependencies = [
     "orjson>=3.9.0",
     "python-multipart>=0.0.6",
     "pillow>=10.0.0",
-    "numpy>=1.26.0",
+    "numpy>=1.26.0,<2.0",
     "opencv-python>=4.9.0",
     "pyobjc-framework-Vision>=10.0",
     "pyobjc-framework-Quartz>=10.0",
     "pyobjc-framework-CoreML>=10.0",
     "mlx>=0.4.0",
     "huggingface-hub>=0.20.0",
-    "onnxruntime-silicon>=1.16.0",
+    "onnxruntime>=1.17.0",
     "insightface>=0.7.3",
 ]
 

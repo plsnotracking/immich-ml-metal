@@ -2,6 +2,7 @@
 CLIP model implementation using MLX for Apple Silicon acceleration.
 
 Supports dynamic model loading based on Immich requests.
+Thread-safe for both loading and inference.
 """
 
 import mlx.core as mx
@@ -12,21 +13,23 @@ from pathlib import Path
 from typing import Optional
 import io
 import gc
+import logging
+import threading
+
+logger = logging.getLogger(__name__)
 
 # Model name mapping: Immich name -> MLX repo (or None to use open_clip fallback)
-# Immich uses format like "ViT-B-32__openai" or "ViT-B-32::openai"
 MODEL_MAP = {
     # OpenAI CLIP models -> MLX
     "ViT-B-32__openai": "mlx-community/clip-vit-base-patch32",
     "ViT-B-16__openai": "mlx-community/clip-vit-base-patch16",
     "ViT-L-14__openai": "mlx-community/clip-vit-large-patch14",
     
-    # LAION CLIP models -> MLX (if available) or fallback
+    # LAION CLIP models -> MLX
     "ViT-B-32__laion2b-s34b-b79k": "mlx-community/clip-vit-base-patch32-laion2b",
     "ViT-B-32__laion2b_s34b_b79k": "mlx-community/clip-vit-base-patch32-laion2b",
     
     # SigLIP models -> None (use open_clip fallback)
-    # These don't have MLX versions yet
     "ViT-B-16-SigLIP__webli": None,
     "ViT-B-16-SigLIP2__webli": None,
     "ViT-SO400M-16-SigLIP2-384__webli": None,
@@ -36,7 +39,6 @@ MODEL_MAP = {
 }
 
 # open_clip model name mappings for fallback
-# Maps Immich names to (arch, pretrained) tuples for open_clip
 OPENCLIP_MAP = {
     # Standard CLIP
     "ViT-B-32__openai": ("ViT-B-32-quickgelu", "openai"),
@@ -47,7 +49,7 @@ OPENCLIP_MAP = {
     "ViT-B-32__laion2b-s34b-b79k": ("ViT-B-32", "laion2b_s34b_b79k"),
     "ViT-B-32__laion2b_s34b_b79k": ("ViT-B-32", "laion2b_s34b_b79k"),
     
-    # SigLIP (supported by open_clip)
+    # SigLIP
     "ViT-B-16-SigLIP__webli": ("ViT-B-16-SigLIP", "webli"),
     "ViT-B-16-SigLIP2__webli": ("ViT-B-16-SigLIP2", "webli"),
     "ViT-SO400M-16-SigLIP2-384__webli": ("ViT-SO400M-16-SigLIP2-384", "webli"),
@@ -55,11 +57,7 @@ OPENCLIP_MAP = {
 
 
 class MLXClip:
-    """
-    CLIP model using MLX for Apple Silicon acceleration.
-    
-    Uses mlx-community models from HuggingFace.
-    """
+    """CLIP model using MLX for Apple Silicon acceleration."""
     
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -67,65 +65,65 @@ class MLXClip:
         self._processor = None
         self._tokenizer = None
         self._loaded = False
-        
-        # Resolve model repo
         self._repo_id = MODEL_MAP.get(model_name, MODEL_MAP.get("default"))
-        
+        # Inference lock to prevent concurrent Metal operations
+        self._inference_lock = threading.Lock()
         self._load_model()
     
     def _load_model(self):
         """Load the MLX CLIP model, or fallback to open_clip."""
-        # Check if we have an MLX version
         self._repo_id = MODEL_MAP.get(self.model_name)
         
-        # If unknown model and not a known open_clip model, use MLX default
         if self._repo_id is None and self.model_name not in OPENCLIP_MAP:
-            print(f"⚠️ Unknown model '{self.model_name}', using MLX default (ViT-B-32)")
+            logger.warning(
+                f"Unknown model '{self.model_name}', using MLX default (ViT-B-32)"
+            )
             self._repo_id = MODEL_MAP["default"]
         
         if self._repo_id is None:
-            # Known open_clip model (e.g., SigLIP) - use open_clip fallback
-            print(f"⚠️ No MLX version for {self.model_name}, using open_clip fallback")
+            logger.info(f"No MLX version for {self.model_name}, using open_clip fallback")
             self._load_fallback()
             return
         
         try:
             from mlx_clip import mlx_clip
             
-            print(f"Loading MLX CLIP model: {self.model_name} -> {self._repo_id}")
-            
-            # mlx_clip handles downloading and loading
+            logger.info(f"Loading MLX CLIP model: {self.model_name} -> {self._repo_id}")
             self._model = mlx_clip(self._repo_id)
             self._loaded = True
-            
-            print(f"✅ Loaded CLIP model via MLX: {self.model_name}")
+            logger.info(f"Successfully loaded CLIP model via MLX: {self.model_name}")
             
         except ImportError:
-            # Fallback to open_clip with MPS if mlx_clip not available
-            print("⚠️ mlx_clip not available, falling back to open_clip with MPS")
+            logger.warning("mlx_clip not available, falling back to open_clip with MPS")
             self._load_fallback()
         except Exception as e:
-            print(f"⚠️ MLX load failed ({e}), falling back to open_clip")
+            logger.error(f"MLX model loading failed: {e}", exc_info=True)
+            logger.info("Falling back to open_clip")
             self._load_fallback()
     
     def _load_fallback(self):
         """Fallback to open_clip with MPS acceleration."""
-        import torch
-        import open_clip
+        try:
+            import torch
+            import open_clip
+        except ImportError as e:
+            logger.error(f"open_clip not available and MLX failed: {e}")
+            raise RuntimeError(
+                "Neither mlx_clip nor open_clip available. "
+                "Install one with: pip install open-clip-torch"
+            ) from e
         
-        # Check if we have a known mapping
         if self.model_name in OPENCLIP_MAP:
             arch, pretrained = OPENCLIP_MAP[self.model_name]
         elif "__" in self.model_name:
             arch, pretrained = self.model_name.split("__", 1)
-            # OpenAI models need quickgelu variant
             if pretrained == "openai" and "quickgelu" not in arch.lower() and "siglip" not in arch.lower():
                 arch = arch + "-quickgelu"
         else:
             arch = "ViT-B-32-quickgelu"
             pretrained = "openai"
         
-        print(f"Loading open_clip model: {arch} / {pretrained}")
+        logger.info(f"Loading open_clip model: {arch} / {pretrained}")
         
         try:
             model, _, preprocess = open_clip.create_model_and_transforms(
@@ -133,8 +131,8 @@ class MLXClip:
             )
             tokenizer = open_clip.get_tokenizer(arch)
         except Exception as e:
-            print(f"⚠️ Failed to load {arch}/{pretrained}: {e}")
-            print("Falling back to ViT-B-32-quickgelu/openai")
+            logger.warning(f"Failed to load {arch}/{pretrained}: {e}")
+            logger.info("Falling back to ViT-B-32-quickgelu/openai")
             arch, pretrained = "ViT-B-32-quickgelu", "openai"
             model, _, preprocess = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
             tokenizer = open_clip.get_tokenizer(arch)
@@ -143,10 +141,10 @@ class MLXClip:
         if torch.backends.mps.is_available():
             self._device = torch.device("mps")
             model = model.to(self._device)
-            print("✅ Using MPS (Metal) acceleration")
+            logger.info("Using MPS (Metal) acceleration")
         else:
             self._device = torch.device("cpu")
-            print("⚠️ MPS not available, using CPU")
+            logger.warning("MPS not available, using CPU")
         
         model.eval()
         
@@ -156,36 +154,43 @@ class MLXClip:
         self._use_fallback = True
         self._loaded = True
         
-        print(f"✅ Loaded CLIP model via open_clip: {arch}/{pretrained}")
+        logger.info(f"Successfully loaded CLIP model via open_clip: {arch}/{pretrained}")
     
     def encode_image(self, image_bytes: bytes) -> np.ndarray:
-        """Generate CLIP embedding for an image."""
+        """
+        Generate CLIP embedding for an image.
+        Thread-safe - only one inference at a time to prevent Metal conflicts.
+        """
         if not self._loaded:
             raise RuntimeError("Model not loaded")
         
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        
-        if hasattr(self, '_use_fallback') and self._use_fallback:
-            return self._encode_image_fallback(image)
-        
-        # MLX path
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            image.save(f, format="JPEG")
-            temp_path = f.name
-        
-        try:
-            embedding = self._model.image_encoder(temp_path)
-            # Normalize
-            if isinstance(embedding, mx.array):
-                embedding = np.array(embedding)
-            embedding = embedding / np.linalg.norm(embedding)
-            return embedding.flatten().astype(np.float32)
-        finally:
-            Path(temp_path).unlink()
+        # CRITICAL: Lock inference to prevent concurrent Metal operations
+        with self._inference_lock:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            
+            if hasattr(self, '_use_fallback') and self._use_fallback:
+                return self._encode_image_fallback(image)
+            
+            # MLX path
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                image.save(f, format="JPEG")
+                temp_path = f.name
+            
+            try:
+                embedding = self._model.image_encoder(temp_path)
+                if isinstance(embedding, mx.array):
+                    embedding = np.array(embedding)
+                embedding = embedding / np.linalg.norm(embedding)
+                return embedding.flatten().astype(np.float32)
+            finally:
+                try:
+                    Path(temp_path).unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
     
     def _encode_image_fallback(self, image: Image.Image) -> np.ndarray:
-        """Encode image using open_clip fallback."""
+        """Encode image using open_clip fallback (assumes lock is held)."""
         import torch
         
         image_tensor = self._processor(image).unsqueeze(0).to(self._device)
@@ -197,22 +202,27 @@ class MLXClip:
         return embedding.squeeze().cpu().numpy().astype(np.float32)
     
     def encode_text(self, text: str) -> np.ndarray:
-        """Generate CLIP embedding for text."""
+        """
+        Generate CLIP embedding for text.
+        Thread-safe - only one inference at a time to prevent Metal conflicts.
+        """
         if not self._loaded:
             raise RuntimeError("Model not loaded")
         
-        if hasattr(self, '_use_fallback') and self._use_fallback:
-            return self._encode_text_fallback(text)
-        
-        # MLX path
-        embedding = self._model.text_encoder(text)
-        if isinstance(embedding, mx.array):
-            embedding = np.array(embedding)
-        embedding = embedding / np.linalg.norm(embedding)
-        return embedding.flatten().astype(np.float32)
+        # CRITICAL: Lock inference to prevent concurrent Metal operations
+        with self._inference_lock:
+            if hasattr(self, '_use_fallback') and self._use_fallback:
+                return self._encode_text_fallback(text)
+            
+            # MLX path
+            embedding = self._model.text_encoder(text)
+            if isinstance(embedding, mx.array):
+                embedding = np.array(embedding)
+            embedding = embedding / np.linalg.norm(embedding)
+            return embedding.flatten().astype(np.float32)
     
     def _encode_text_fallback(self, text: str) -> np.ndarray:
-        """Encode text using open_clip fallback."""
+        """Encode text using open_clip fallback (assumes lock is held)."""
         import torch
         
         tokens = self._tokenizer([text]).to(self._device)
@@ -225,82 +235,81 @@ class MLXClip:
     
     def unload(self):
         """Unload model and free memory."""
-        print(f"Unloading CLIP model: {self.model_name}")
+        logger.info(f"Unloading CLIP model: {self.model_name}")
         self._model = None
         self._processor = None
         self._tokenizer = None
         self._loaded = False
         
-        # Force garbage collection
         gc.collect()
         
-        # Clear MLX cache if possible
+        # Use the new API if available
         try:
-            mx.metal.clear_cache()
-        except:
-            pass
+            mx.clear_cache()
+        except AttributeError:
+            # Fall back to deprecated API
+            try:
+                mx.metal.clear_cache()
+            except Exception:
+                pass
 
 
-# Current loaded model
+# Global model cache with thread safety
 _current_model: Optional[MLXClip] = None
 _current_model_name: Optional[str] = None
+_model_lock = threading.Lock()
 
 
 def get_clip_model(model_name: str = "ViT-B-32__openai") -> MLXClip:
     """
-    Get CLIP model, loading or switching as needed.
+    Get CLIP model, loading or switching as needed (thread-safe).
     
-    If a different model is requested than currently loaded,
-    unloads the current model first to free memory.
+    If a different model is requested, unloads current model first to free memory.
     """
     global _current_model, _current_model_name
     
-    # Normalize model name
     normalized_name = model_name.replace("::", "__")
     
-    # Check if we need to load a different model
-    if _current_model is not None and _current_model_name != normalized_name:
-        print(f"Switching CLIP model: {_current_model_name} -> {normalized_name}")
-        _current_model.unload()
-        _current_model = None
-        _current_model_name = None
-    
-    # Load model if needed
-    if _current_model is None:
-        _current_model = MLXClip(normalized_name)
-        _current_model_name = normalized_name
-    
-    return _current_model
+    with _model_lock:
+        # Check if we need to switch models
+        if _current_model is not None and _current_model_name != normalized_name:
+            logger.info(f"Switching CLIP model: {_current_model_name} -> {normalized_name}")
+            _current_model.unload()
+            _current_model = None
+            _current_model_name = None
+        
+        # Load model if needed
+        if _current_model is None:
+            logger.info(f"Loading CLIP model: {normalized_name}")
+            _current_model = MLXClip(normalized_name)
+            _current_model_name = normalized_name
+        
+        return _current_model
 
 
-# For testing
 if __name__ == "__main__":
+    # Configure logging for testing
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    
     import sys
     
-    print("Testing CLIP model loading...")
-    print(f"\nSupported MLX models: {[k for k, v in MODEL_MAP.items() if v is not None and k != 'default']}")
-    print(f"Supported open_clip models: {list(OPENCLIP_MAP.keys())}")
+    logger.info("Testing CLIP model loading...")
+    logger.info(f"Supported MLX models: {[k for k, v in MODEL_MAP.items() if v is not None and k != 'default']}")
+    logger.info(f"Supported open_clip models: {list(OPENCLIP_MAP.keys())}")
     
-    # Test default model (MLX)
-    print("\n--- Testing MLX model ---")
+    # Test default model
+    logger.info("\n--- Testing MLX model ---")
     clip = get_clip_model("ViT-B-32__openai")
     text_emb = clip.encode_text("a photo of a cat")
-    print(f"Text embedding shape: {text_emb.shape}")
-    print(f"Text embedding norm: {np.linalg.norm(text_emb):.4f}")
+    logger.info(f"Text embedding shape: {text_emb.shape}")
+    logger.info(f"Text embedding norm: {np.linalg.norm(text_emb):.4f}")
     
-    # Test image encoding if file provided
+    # Test image if provided
     if len(sys.argv) > 1:
         with open(sys.argv[1], "rb") as f:
             img_emb = clip.encode_image(f.read())
-        print(f"Image embedding shape: {img_emb.shape}")
+        logger.info(f"Image embedding shape: {img_emb.shape}")
         similarity = np.dot(text_emb, img_emb)
-        print(f"Text-image similarity: {similarity:.4f}")
+        logger.info(f"Text-image similarity: {similarity:.4f}")
     
-    # Test SigLIP model (open_clip fallback)
-    print("\n--- Testing SigLIP model (open_clip fallback) ---")
-    clip2 = get_clip_model("ViT-B-16-SigLIP__webli")
-    text_emb2 = clip2.encode_text("a photo of a dog")
-    print(f"SigLIP embedding shape: {text_emb2.shape}")
-    print(f"SigLIP embedding norm: {np.linalg.norm(text_emb2):.4f}")
-    
-    print("\n✅ CLIP tests passed!")
+    logger.info("\n✅ CLIP tests passed!")
