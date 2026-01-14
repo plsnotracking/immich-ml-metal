@@ -2,7 +2,7 @@
 
 > **⚠️ Important Disclaimer**: I (the repository owner) am not a software developer. This project was architected, designed, and primarily authored by Claude based on my requirements and feedback. While I've tested it in my home environment, please treat this as an **experimental community project** rather than production-ready software. I'm sharing this in hopes it's useful for the Mac community. If it's not helpful for you, please don't feel pressured to use it.
 
-A Metal/ANE-optimized drop-in replacement for [Immich's](https://immich.app/) machine learning service, designed specifically for Apple Silicon Macs. This allows Mac users to run Immich's ML workloads natively on their hardware instead of requiring Docker Desktop.
+A Metal/ANE-optimized drop-in replacement for [Immich's](https://immich.app/) machine learning service, designed specifically for Apple Silicon Macs. This allows Mac users to run Immich's ML workloads natively on their hardware.
 
 ## What This Does
 
@@ -15,11 +15,11 @@ Immich's standard ML container runs well on NVIDIA, Intel, and AMD GPUs. Recentl
 
 ## Performance: Why This is Fast
 
-This service uses Apple's MLX framework for CLIP. In my testing, this is significantly faster than alternatives (PyTorch or CPU-only). Due to Metal GPU limitations (AFAIK), inference requests are processed sequentially, but **total throughput is still excellent**:
+This service uses Apple's MLX framework for CLIP. In my testing, this is significantly faster than alternatives (PyTorch or CPU-only). Due to Metal GPU limitations (AFAIK), inference requests are processed sequentially, but **total throughput is still pretty good**:
 
 ## Project Status
 
-**⚠️ Alpha Quality - Use at Your Own Risk**
+** A(I)lpha Quality - Use at Your Own Risk**
 
 - [x] Phase 0: API contract documentation
 - [x] Phase 1: Project setup  
@@ -32,7 +32,7 @@ This service uses Apple's MLX framework for CLIP. In my testing, this is signifi
 - [ ] Phase 8: Community testing and validation
 
 **Known Limitations:**
-- Only tested in my specific home setup (MacBook Pro M1, macOS 15.2, Immich v1.122.x)
+- Only tested in my specific home setup (MacBook Pro M1, macOS 26.1, Immich v2.4.1)
 - Not all Immich ML features may be fully compatible
 - Memory usage not extensively optimized
 - No load testing performed
@@ -40,9 +40,9 @@ This service uses Apple's MLX framework for CLIP. In my testing, this is signifi
 
 ## Requirements
 
-- **macOS 13+** (Ventura or later)
+- **macOS Tahoe+** (Might work on earlier OSs, but you'd have to test it yourself)
 - **Apple Silicon Mac** (M1/M2/M3/M4 - Intel Macs not supported)
-- **Python 3.11**
+- **Python 3.11** (Not working on 3.13)
 - **Immich server** already running (this replaces just the ML service)
 
 ## Installation
@@ -64,8 +64,7 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# First run will download models (~500MB-2GB depending on choices)
-# This may take 5-15 minutes
+# First run will download models
 python -m src.main
 ```
 
@@ -88,13 +87,13 @@ Configure via environment variables or edit `src/config.py`:
 
 **CLIP Model Mapping**:
 - OpenAI CLIP models -> MLX
-  - `ViT-B-32__openai`: `mlx-community/clip-vit-base-patch32`
-  - `ViT-B-16__openai`: `mlx-community/clip-vit-base-patch16`
-  - `ViT-L-14__openai`: `mlx-community/clip-vit-large-patch14`
+  - `ViT-B-32__openai` -> `mlx-community/clip-vit-base-patch32`
+  - `ViT-B-16__openai`-> `mlx-community/clip-vit-base-patch16`
+  - `ViT-L-14__openai`-> `mlx-community/clip-vit-large-patch14`
     
 - LAION CLIP models -> MLX
-  - `ViT-B-32__laion2b-s34b-b79k`: `mlx-community/clip-vit-base-patch32-laion2b`
-  - `ViT-B-32__laion2b_s34b_b79k`: `mlx-community/clip-vit-base-patch32-laion2b`
+  - `ViT-B-32__laion2b-s34b-b79k`-> `mlx-community/clip-vit-base-patch32-laion2b`
+  - `ViT-B-32__laion2b_s34b_b79k`-> `mlx-community/clip-vit-base-patch32-laion2b`
     
 - SigLIP models -> None (uses open_clip fallback)
   - `ViT-B-16-SigLIP__webli`
