@@ -7,8 +7,7 @@ name = "immich-ml-metal"
 version = "0.1.0"
 description = "Metal/ANE-optimized drop-in replacement for Immich's ML service"
 readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
+requires-python = "3.11"
 authors = [
     {name = "Your Name", email = "you@example.com"}
 ]
@@ -17,11 +16,8 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: MacOS Tahoe",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
