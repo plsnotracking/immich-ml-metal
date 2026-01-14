@@ -1,15 +1,25 @@
 """Configuration settings for immich-ml-metal."""
 
-import os
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Literal
+from __future__ import annotations
+
 import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Final, Literal, TypeAlias
 
-LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+LogLevel: TypeAlias = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+# Supported face recognition models
+SUPPORTED_FACE_MODELS: Final[tuple[str, ...]] = (
+    "buffalo_s",   # Small: ~60MB, fastest, lower accuracy
+    "buffalo_m",   # Medium: ~150MB, balanced
+    "buffalo_l",   # Large: ~350MB, best accuracy (Immich default)
+    "antelopev2",  # Alternative: ~200MB, high-quality recognition
+)
 
 
-@dataclass
+@dataclass(slots=True)
 class Settings:
     """Application settings with sensible defaults."""
     
@@ -30,8 +40,11 @@ class Settings:
     clip_buffer_ram_limit_mb: int = 256  # Max MB to buffer in RAM for encode queue
     
     # Face recognition settings
-    # buffalo_l is Immich's default, provides best accuracy
-    # buffalo_s and buffalo_m are smaller alternatives
+    # Supported models: buffalo_s, buffalo_m, buffalo_l, antelopev2
+    # - buffalo_l: Immich's default, best accuracy (~350MB)
+    # - buffalo_m: Balanced option (~150MB)
+    # - buffalo_s: Smallest/fastest (~60MB)
+    # - antelopev2: High-quality alternative (~200MB)
     face_model: str = "buffalo_l"
     
     # Face detection threshold - Immich default is 0.7
@@ -68,7 +81,7 @@ class Settings:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
     
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         """Load settings from environment variables."""
         return cls(
             host=os.getenv("ML_HOST", "0.0.0.0"),
@@ -85,7 +98,7 @@ class Settings:
             max_concurrent_requests=int(os.getenv("ML_MAX_CONCURRENT_REQUESTS", "4")),
             max_image_size=int(os.getenv("ML_MAX_IMAGE_SIZE", str(50 * 1024 * 1024))),
             request_timeout=int(os.getenv("ML_REQUEST_TIMEOUT", "120")),
-            log_level=os.getenv("ML_LOG_LEVEL", "INFO").upper(),
+            log_level=os.getenv("ML_LOG_LEVEL", "INFO").upper(),  # type: ignore[arg-type]
             log_requests=os.getenv("ML_LOG_REQUESTS", "true").lower() == "true",
             debug_mode=os.getenv("ML_DEBUG_MODE", "false").lower() == "true",
         )

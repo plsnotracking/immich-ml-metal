@@ -4,48 +4,62 @@ OCR (Optical Character Recognition) using Apple's Vision framework.
 Uses VNRecognizeTextRequest for hardware-accelerated text recognition on Apple Silicon.
 """
 
-import numpy as np
-from PIL import Image
+from __future__ import annotations
+
 import io
-from typing import Optional
 import logging
-from Foundation import NSData, NSAutoreleasePool
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+from Foundation import NSAutoreleasePool, NSData
+from PIL import Image
+
 import Vision
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
+
+
+class OCRResult(TypedDict):
+    """OCR result matching Immich format."""
+    text: list[str]
+    box: list[int]  # 8 coords per text (quadrilateral corners)
+    boxScore: list[float]
+    textScore: list[float]
 
 
 def recognize_text(
     image_bytes: bytes,
     min_confidence: float = 0.0,
-    recognition_level: str = "accurate",
-    use_language_correction: bool = True
-) -> dict:
+    recognition_level: Literal["accurate", "fast"] = "accurate",
+    use_language_correction: bool = True,
+) -> OCRResult:
     """
     Perform OCR using Apple's Vision framework.
     
     Args:
         image_bytes: Raw image data (JPEG, PNG, etc.)
         min_confidence: Minimum confidence threshold (0.0 - 1.0)
-        recognition_level: "accurate" or "fast"
+        recognition_level: "accurate" for best quality, "fast" for speed
         use_language_correction: Enable language correction (better for natural text,
                                  disable for technical text, serial numbers, codes)
         
     Returns:
-        Dict matching Immich OCR response format:
-        {
-            "text": [str, ...],
-            "box": [x1, y1, x2, y2, x3, y3, x4, y4, ...],  # 8 coords per text
-            "boxScore": [float, ...],
-            "textScore": [float, ...]
-        }
+        Dict matching Immich OCR response format with keys:
+            - text: List of detected text strings
+            - box: Flat list of coordinates (8 per text region)
+            - boxScore: Detection confidence per region
+            - textScore: Recognition confidence per text
     """
+    empty_result: OCRResult = {"text": [], "box": [], "boxScore": [], "textScore": []}
+    
     try:
         pil_image = Image.open(io.BytesIO(image_bytes))
         img_width, img_height = pil_image.size
     except Exception as e:
         logger.error(f"Failed to load image: {e}")
-        return {"text": [], "box": [], "boxScore": [], "textScore": []}
+        return empty_result
     
     # Use autorelease pool to prevent memory accumulation in long-running service
     pool = NSAutoreleasePool.alloc().init()
@@ -63,19 +77,23 @@ def _recognize_text_impl(
     img_width: int,
     img_height: int,
     min_confidence: float,
-    recognition_level: str,
-    use_language_correction: bool
-) -> dict:
+    recognition_level: Literal["accurate", "fast"],
+    use_language_correction: bool,
+) -> OCRResult:
     """Internal OCR implementation (assumes autorelease pool is active)."""
+    empty_result: OCRResult = {"text": [], "box": [], "boxScore": [], "textScore": []}
+    
     try:
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
         handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(ns_data, None)
         request = Vision.VNRecognizeTextRequest.alloc().init()
         
-        if recognition_level == "fast":
-            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelFast)
-        else:
-            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        # Set recognition level using match statement
+        match recognition_level:
+            case "fast":
+                request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelFast)
+            case "accurate" | _:
+                request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
         
         request.setUsesLanguageCorrection_(use_language_correction)
         
@@ -83,12 +101,13 @@ def _recognize_text_impl(
         
         if not success or error:
             logger.error(f"Vision OCR error: {error}")
-            return {"text": [], "box": [], "boxScore": [], "textScore": []}
+            return empty_result
         
-        texts = []
-        boxes = []
-        box_scores = []
-        text_scores = []
+        # Process results
+        texts: list[str] = []
+        boxes: list[int] = []
+        box_scores: list[float] = []
+        text_scores: list[float] = []
         
         results = request.results() or []
         
@@ -134,57 +153,59 @@ def _recognize_text_impl(
         
         logger.debug(f"OCR detected {len(texts)} text region(s)")
         
-        return {
-            "text": texts,
-            "box": boxes,
-            "boxScore": box_scores,
-            "textScore": text_scores
-        }
+        return OCRResult(
+            text=texts,
+            box=boxes,
+            boxScore=box_scores,
+            textScore=text_scores,
+        )
         
     except Exception as e:
         logger.error(f"OCR failed: {e}", exc_info=True)
-        return {"text": [], "box": [], "boxScore": [], "textScore": []}
+        return empty_result
 
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
     
-    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+    from PIL import ImageDraw
     
-    if len(sys.argv) < 2:
-        logger.info("Usage: python -m src.models.ocr <image_path>")
-        logger.info("Creating test image with text...")
-        
-        from PIL import ImageDraw
-        
-        img = Image.new("RGB", (400, 200), color="white")
-        draw = ImageDraw.Draw(img)
-        
-        draw.text((20, 30), "Hello World!", fill="black")
-        draw.text((20, 80), "immich-ml-metal", fill="blue")
-        draw.text((20, 130), "OCR Test 123", fill="darkgreen")
-        
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        test_bytes = buffer.getvalue()
-        
-        img.save("ocr_test.png")
-        logger.info("Saved test image to ocr_test.png")
-    else:
-        with open(sys.argv[1], "rb") as f:
-            test_bytes = f.read()
+    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+    
+    match sys.argv[1:]:
+        case []:
+            logger.info("Usage: python -m src.models.ocr <image_path>")
+            logger.info("Creating test image with text...")
+            
+            img = Image.new("RGB", (400, 200), color="white")
+            draw = ImageDraw.Draw(img)
+            
+            draw.text((20, 30), "Hello World!", fill="black")
+            draw.text((20, 80), "immich-ml-metal", fill="blue")
+            draw.text((20, 130), "OCR Test 123", fill="darkgreen")
+            
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG")
+            test_bytes = buffer.getvalue()
+            
+            img.save("ocr_test.png")
+            logger.info("Saved test image to ocr_test.png")
+            
+        case [image_path, *_]:
+            test_bytes = Path(image_path).read_bytes()
     
     logger.info("Testing Vision framework OCR...")
     logger.info("With language correction enabled:")
     result = recognize_text(test_bytes, use_language_correction=True)
     
     logger.info(f"Detected {len(result['text'])} text region(s):")
-    for i, text in enumerate(result['text']):
-        text_score = result['textScore'][i]
-        box_score = result['boxScore'][i]
+    for i, text in enumerate(result["text"]):
+        text_score = result["textScore"][i]
+        box_score = result["boxScore"][i]
         box_start = i * 8
-        coords = result['box'][box_start:box_start + 8]
-        logger.info(f"  [text:{text_score:.2f} box:{box_score:.2f}] \"{text}\"")
+        coords = result["box"][box_start : box_start + 8]
+        logger.info(f'  [text:{text_score:.2f} box:{box_score:.2f}] "{text}"')
         logger.info(f"         Box: {coords}")
     
     logger.info("\n✅ OCR test complete!")

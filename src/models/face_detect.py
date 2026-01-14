@@ -4,20 +4,40 @@ Face detection using Apple's Vision framework.
 Runs on the Neural Engine (ANE) for hardware acceleration.
 """
 
-import numpy as np
-from PIL import Image
+from __future__ import annotations
+
 import io
-from typing import Optional
 import logging
+from typing import TYPE_CHECKING, TypedDict
+
 import objc
-from Foundation import NSData, NSAutoreleasePool
+from Foundation import NSAutoreleasePool, NSData
+from PIL import Image
+
 import Vision
-import Quartz
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
 
-def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
+class BoundingBox(TypedDict):
+    """Bounding box coordinates in pixels."""
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+
+class FaceDetection(TypedDict, total=False):
+    """Face detection result."""
+    boundingBox: BoundingBox
+    score: float
+    landmarks: list[list[float]]
+
+
+def detect_faces(image_bytes: bytes) -> tuple[list[FaceDetection], int, int]:
     """
     Detect faces using Apple's Vision framework.
     
@@ -25,11 +45,14 @@ def detect_faces(image_bytes: bytes) -> tuple[list[dict], int, int]:
         image_bytes: Raw image data (JPEG, PNG, etc.)
         
     Returns:
-        Tuple of (faces, image_width, image_height)
+        Tuple of (faces, image_width, image_height).
         Each face dict contains:
           - boundingBox: {x1, y1, x2, y2} in pixels
           - score: confidence score
           - landmarks: 5-point landmarks for alignment (if available)
+          
+    Raises:
+        ValueError: If image data is invalid.
     """
     try:
         pil_image = Image.open(io.BytesIO(image_bytes))
@@ -50,7 +73,7 @@ def _detect_faces_impl(
     image_bytes: bytes, 
     img_width: int, 
     img_height: int
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[FaceDetection], int, int]:
     """Internal face detection implementation (assumes autorelease pool is active)."""
     try:
         ns_data = NSData.dataWithBytes_length_(image_bytes, len(image_bytes))
@@ -63,7 +86,7 @@ def _detect_faces_impl(
             logger.error(f"Vision framework error: {error}")
             return [], img_width, img_height
         
-        faces = []
+        faces: list[FaceDetection] = []
         results = request.results() or []
         
         for observation in results:
@@ -75,19 +98,19 @@ def _detect_faces_impl(
             x2 = (bbox.origin.x + bbox.size.width) * img_width
             y2 = (1.0 - bbox.origin.y) * img_height
             
-            face_data = {
+            face_data: FaceDetection = {
                 "boundingBox": {
                     "x1": int(x1),
                     "y1": int(y1),
                     "x2": int(x2),
-                    "y2": int(y2)
+                    "y2": int(y2),
                 },
                 "score": float(observation.confidence()),
             }
             
             landmarks = observation.landmarks()
             if landmarks:
-                five_points = extract_five_point_landmarks(landmarks, img_width, img_height)
+                five_points = _extract_five_point_landmarks(landmarks, img_width, img_height)
                 if five_points is not None:
                     face_data["landmarks"] = five_points
             
@@ -101,11 +124,11 @@ def _detect_faces_impl(
         return [], img_width, img_height
 
 
-def extract_five_point_landmarks(
-    landmarks: "Vision.VNFaceLandmarks2D",
+def _extract_five_point_landmarks(
+    landmarks: Vision.VNFaceLandmarks2D,
     img_width: int,
-    img_height: int
-) -> Optional[list[list[float]]]:
+    img_height: int,
+) -> list[list[float]] | None:
     """
     Extract 5 landmark points for ArcFace alignment:
     - Left eye center
@@ -116,7 +139,7 @@ def extract_five_point_landmarks(
     
     Returns list of [x, y] points in pixel coordinates, or None if not available.
     """
-    def get_region_points(region) -> list:
+    def get_region_points(region: object) -> list:
         """Convert PyObjC varlist to Python list of points."""
         if region is None:
             return []
@@ -126,7 +149,7 @@ def extract_five_point_landmarks(
         raw_points = region.normalizedPoints()
         return [raw_points[i] for i in range(point_count)]
     
-    def get_region_center(region) -> Optional[list[float]]:
+    def get_region_center(region: object) -> list[float] | None:
         """Get center point of a landmark region."""
         points = get_region_points(region)
         if not points:
@@ -149,7 +172,7 @@ def extract_five_point_landmarks(
         right_eye = get_region_center(landmarks.rightEye())
         
         # Nose tip - use last point of nose region
-        nose = None
+        nose: list[float] | None = None
         nose_points = get_region_points(landmarks.nose())
         if nose_points:
             p = nose_points[-1]
@@ -157,8 +180,8 @@ def extract_five_point_landmarks(
         
         # Mouth corners - find leftmost and rightmost points by x-coordinate
         # (Vision framework doesn't guarantee point ordering in contours)
-        left_mouth = None
-        right_mouth = None
+        left_mouth: list[float] | None = None
+        right_mouth: list[float] | None = None
         outer_lips_points = get_region_points(landmarks.outerLips())
         if outer_lips_points:
             # Convert all points to pixel coordinates
@@ -172,7 +195,7 @@ def extract_five_point_landmarks(
         
         # All 5 points must be present
         if all([left_eye, right_eye, nose, left_mouth, right_mouth]):
-            return [left_eye, right_eye, nose, left_mouth, right_mouth]
+            return [left_eye, right_eye, nose, left_mouth, right_mouth]  # type: ignore[list-item]
         
         logger.debug("Could not extract all 5 landmark points")
         return None
@@ -184,20 +207,21 @@ def extract_five_point_landmarks(
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
     
-    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
     
-    if len(sys.argv) < 2:
-        logger.info("Usage: python -m src.models.face_detect <image_path>")
-        logger.info("Creating test with a blank image...")
-        
-        test_img = Image.new("RGB", (640, 480), color=(200, 180, 170))
-        buffer = io.BytesIO()
-        test_img.save(buffer, format="JPEG")
-        test_bytes = buffer.getvalue()
-    else:
-        with open(sys.argv[1], "rb") as f:
-            test_bytes = f.read()
+    match sys.argv[1:]:
+        case []:
+            logger.info("Usage: python -m src.models.face_detect <image_path>")
+            logger.info("Creating test with a blank image...")
+            
+            test_img = Image.new("RGB", (640, 480), color=(200, 180, 170))
+            buffer = io.BytesIO()
+            test_img.save(buffer, format="JPEG")
+            test_bytes = buffer.getvalue()
+        case [image_path, *_]:
+            test_bytes = Path(image_path).read_bytes()
     
     logger.info("Testing Vision framework face detection...")
     faces, width, height = detect_faces(test_bytes)
@@ -209,9 +233,10 @@ if __name__ == "__main__":
         logger.info(f"\nFace {i + 1}:")
         logger.info(f"  Bounding box: {face['boundingBox']}")
         logger.info(f"  Score: {face['score']:.3f}")
-        if "landmarks" in face:
-            logger.info(f"  Landmarks (5-point): ✓")
-        else:
-            logger.info(f"  Landmarks: not available")
+        match "landmarks" in face:
+            case True:
+                logger.info("  Landmarks (5-point): ✓")
+            case False:
+                logger.info("  Landmarks: not available")
     
     logger.info("\n✅ Face detection test complete!")

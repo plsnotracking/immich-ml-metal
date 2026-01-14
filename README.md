@@ -107,9 +107,10 @@ Configure via environment variables or edit `src/config.py`:
 - Default fallback: `mlx-community/clip-vit-base-patch32`
 
 **Face Models**:
-- `buffalo_s`
-- `buffalo_m`
-- `buffalo_l` - **default**
+- `buffalo_s` - Small (~60MB), fastest, lower accuracy
+- `buffalo_m` - Medium (~150MB), balanced
+- `buffalo_l` - Large (~350MB), **default**, best accuracy
+- `antelopev2` - Alternative (~200MB), high-quality recognition
 
 ## Connecting to Immich
 
