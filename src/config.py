@@ -30,9 +30,9 @@ class Settings:
     clip_buffer_ram_limit_mb: int = 256  # Max MB to buffer in RAM for encode queue
     
     # Face recognition settings
-    # buffalo_l is Immich's default, provides best accuracy
-    # buffalo_s and buffalo_m are smaller alternatives
-    face_model: str = "buffalo_l"
+    # antelopev2 uses glintr100 (best accuracy, Immich default for new installs)
+    # buffalo_l, buffalo_m, buffalo_s are alternatives
+    face_model: str = "antelopev2"
     
     # Face detection threshold - Immich default is 0.7
     # Lower values = more faces detected (more false positives)
@@ -77,7 +77,7 @@ class Settings:
             cache_dir=Path(os.getenv("ML_CACHE_DIR", "./cache")),
             clip_model=os.getenv("ML_CLIP_MODEL", "ViT-B-32__openai"),
             clip_buffer_ram_limit_mb=int(os.getenv("ML_CLIP_BUFFER_RAM_MB", "256")),
-            face_model=os.getenv("ML_FACE_MODEL", "buffalo_l"),
+            face_model=os.getenv("ML_FACE_MODEL", "antelopev2"),
             face_min_score=float(os.getenv("ML_FACE_MIN_SCORE", "0.7")),
             ocr_use_language_correction=os.getenv("ML_OCR_LANGUAGE_CORRECTION", "true").lower() == "true",
             use_coreml=os.getenv("ML_USE_COREML", "true").lower() == "true",

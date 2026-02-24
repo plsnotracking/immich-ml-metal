@@ -77,7 +77,7 @@ Configure via environment variables or edit `src/config.py`:
 | `ML_MODELS_DIR` | `./models` | Model storage directory |
 | `ML_CLIP_MODEL` | `ViT-B-32__openai` | CLIP model name |
 | `ML_CLIP_BUFFER_RAM_MB` | `256` | Max RAM for image encode queue (MB) |
-| `ML_FACE_MODEL` | `buffalo_l` | Face recognition model (buffalo_s/m/l) |
+| `ML_FACE_MODEL` | `antelopev2` | Face recognition model (antelopev2/buffalo_l/m/s) |
 | `ML_FACE_MIN_SCORE` | `0.7` | Face detection confidence threshold |
 | `ML_OCR_LANGUAGE_CORRECTION` | `true` | Language correction for OCR (disable for codes/serials) |
 | `ML_USE_COREML` | `true` | Enable CoreML acceleration |
@@ -107,9 +107,10 @@ Configure via environment variables or edit `src/config.py`:
 - Default fallback: `mlx-community/clip-vit-base-patch32`
 
 **Face Models**:
-- `buffalo_s`
+- `antelopev2` - **default** (uses glintr100, best accuracy)
+- `buffalo_l`
 - `buffalo_m`
-- `buffalo_l` - **default**
+- `buffalo_s`
 
 ## Connecting to Immich
 

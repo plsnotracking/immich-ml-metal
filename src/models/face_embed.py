@@ -28,7 +28,7 @@ _model_lock = threading.Lock()
 _inference_lock = threading.Lock()
 
 
-def get_recognition_model(model_name: str = "buffalo_l"):
+def get_recognition_model(model_name: str = "antelopev2"):
     """
     Get or create the face recognition model (thread-safe).
     
@@ -36,7 +36,7 @@ def get_recognition_model(model_name: str = "buffalo_l"):
     If a different model is requested, unloads the current one first.
     
     Args:
-        model_name: InsightFace model name (buffalo_s, buffalo_m, buffalo_l)
+        model_name: InsightFace model name (antelopev2, buffalo_l, buffalo_m, buffalo_s)
     """
     global _recognition_model, _current_model_name
     
@@ -168,6 +168,12 @@ def _load_model(model_name: str):
             logger.error(f"Failed to download model pack: {e}", exc_info=True)
             raise RuntimeError(f"Could not download {model_name} model pack") from e
     
+    # Handle nested directory (some zips extract as model_name/model_name/)
+    nested_dir = model_dir / model_name
+    if nested_dir.is_dir() and not list(model_dir.glob("*.onnx")):
+        logger.info(f"Using nested model directory: {nested_dir}")
+        model_dir = nested_dir
+    
     # Find the recognition model using robust detection
     rec_model_path = _find_recognition_model(model_dir)
     
@@ -204,7 +210,7 @@ def unload_recognition_model():
 def get_face_embedding(
     image_bytes: bytes,
     landmarks: list[list[float]],
-    model_name: str = "buffalo_l"
+    model_name: str = "antelopev2"
 ) -> np.ndarray:
     """
     Generate 512-dim face embedding using ArcFace (thread-safe).
@@ -259,7 +265,7 @@ def get_face_embedding(
 def get_face_embedding_from_bbox(
     image_bytes: bytes,
     bbox: dict,
-    model_name: str = "buffalo_l"
+    model_name: str = "antelopev2"
 ) -> Optional[np.ndarray]:
     """
     Generate face embedding using bounding box (fallback, thread-safe).
@@ -317,7 +323,7 @@ def get_face_embedding_from_bbox(
 
 
 # Alias for backward compatibility
-def get_face_recognizer(model_name: str = "buffalo_l"):
+def get_face_recognizer(model_name: str = "antelopev2"):
     """Alias for get_recognition_model for backward compatibility."""
     return get_recognition_model(model_name)
 
@@ -330,7 +336,7 @@ if __name__ == "__main__":
     logger.info("Testing face embedding generation...")
     logger.info("(This will download the model on first run)")
     
-    model = get_recognition_model("buffalo_l")
+    model = get_recognition_model("antelopev2")
     logger.info(f"Model loaded successfully: {type(model).__name__}")
     
     if len(sys.argv) > 1:
@@ -349,10 +355,10 @@ if __name__ == "__main__":
             logger.info(f"  Score: {face['score']:.3f}")
             
             if "landmarks" in face:
-                embedding = get_face_embedding(image_bytes, face["landmarks"], "buffalo_l")
+                embedding = get_face_embedding(image_bytes, face["landmarks"], "antelopev2")
                 logger.info(f"  Embedding (landmark-aligned): {embedding.shape}")
             else:
-                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], "buffalo_l")
+                embedding = get_face_embedding_from_bbox(image_bytes, face["boundingBox"], "antelopev2")
                 logger.info(f"  Embedding (bbox-cropped): {embedding.shape}")
             
             if embedding is not None:
